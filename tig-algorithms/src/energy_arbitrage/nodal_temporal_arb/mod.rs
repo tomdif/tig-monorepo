@@ -12,17 +12,19 @@ pub struct Hyperparameters {
     pub min_window_std: f64,
     pub action_sharpness: f64,
     pub profit_floor_shrink: f64,
+    pub jump_z_threshold: f64,
 }
 
 impl Default for Hyperparameters {
     fn default() -> Self {
         Self {
             horizon_steps: 192,
-            urgency_gain: 0.5,
-            rt_z_gain: 1.5,
-            min_window_std: 1.0,
-            action_sharpness: 0.5,
+            urgency_gain: 1.0,
+            rt_z_gain: 1.0,
+            min_window_std: 0.0,
+            action_sharpness: 0.30,
             profit_floor_shrink: 0.95,
+            jump_z_threshold: 2.0,
         }
     }
 }
@@ -31,9 +33,11 @@ pub fn help() {
     println!(
         "nodal_temporal_arb: per-node temporal arbitrage. Targets SOC by price-rank \
 in a per-node DA window, modulates with standardized RT deviation, projects to \
-PTDF feasibility, and enforces non-negative cumulative profit. \
+PTDF feasibility, enforces non-negative cumulative profit, and falls through to a \
+full-bound bang when the realised RT price deviates from DA forecast by at least \
+`jump_z_threshold` window-stds (capturing tail-jump events). \
 Hyperparameters: horizon_steps, urgency_gain, rt_z_gain, min_window_std, \
-action_sharpness, profit_floor_shrink."
+action_sharpness, profit_floor_shrink, jump_z_threshold."
     );
 }
 
@@ -231,6 +235,16 @@ pub fn policy(challenge: &Challenge, state: &State, hp: &Hyperparameters) -> Res
         }
 
         let p_now = da[t][n];
+        let z_rt = (state.rt_prices[n] - p_now) / std.max(EPS);
+
+        // Tail-jump override: when the realised RT price deviates by jump_z_threshold or
+        // more window-stds, force a full-bound action toward the deviation sign. This
+        // captures Pareto jumps that the smoothed signal would only respond to partially.
+        if hp.jump_z_threshold > 0.0 && z_rt.abs() >= hp.jump_z_threshold {
+            action[i] = if z_rt > 0.0 { hi } else { lo };
+            continue;
+        }
+
         let rank = price_rank(&window, p_now);
 
         // Target SOC fraction: extreme prices → extreme target.
@@ -245,7 +259,6 @@ pub fn policy(challenge: &Challenge, state: &State, hp: &Hyperparameters) -> Res
 
         // Standardized RT deviation. Bounded via tanh: large RT spikes saturate to ±1.
         let _ = mean; // mean unused; rank captures position
-        let z_rt = (state.rt_prices[n] - p_now) / std.max(EPS);
         let rt_signal = (z_rt * hp.rt_z_gain * 0.5).tanh();
 
         // Combined signal in [-1, 1]; sharpness controls bang-bang vs continuous.
