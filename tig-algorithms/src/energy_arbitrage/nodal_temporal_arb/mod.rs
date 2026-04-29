@@ -166,6 +166,40 @@ fn enforce_flow_feasibility(
     Ok(base.into_iter().map(|u| low * u).collect())
 }
 
+/// After the projection, the action may be feasible but with slack on every line.
+/// Find the largest scalar α ≥ 1 such that α * action is still feasible (PTDF + per-battery
+/// bounds), and apply it. Captures any slack the greedy projection left on the table.
+fn expand_to_feasibility_limit(challenge: &Challenge, state: &State, action: &[f64]) -> Vec<f64> {
+    if action.iter().all(|u| u.abs() <= EPS) {
+        return action.to_vec();
+    }
+    let mut alpha_max = f64::INFINITY;
+    for (i, &u) in action.iter().enumerate() {
+        if u.abs() <= EPS { continue; }
+        let (lo, hi) = state.action_bounds[i];
+        let bound = if u > 0.0 { hi / u } else { lo / u };
+        if bound.is_finite() && bound < alpha_max { alpha_max = bound; }
+    }
+    if !alpha_max.is_finite() || alpha_max <= 1.0 + EPS {
+        return action.to_vec();
+    }
+    let mut lo_a = 1.0;
+    let mut hi_a = alpha_max.max(1.0);
+    for _ in 0..GLOBAL_SCALE_BSEARCH_ITERS {
+        let mid = 0.5 * (lo_a + hi_a);
+        let scaled: Vec<f64> = action.iter().map(|u| mid * u).collect();
+        if is_flow_feasible(challenge, state, &scaled) { lo_a = mid; } else { hi_a = mid; }
+    }
+    if lo_a <= 1.0 + EPS {
+        return action.to_vec();
+    }
+    action.iter().enumerate()
+        .map(|(i, u)| {
+            let (lo, hi) = state.action_bounds[i];
+            (lo_a * u).clamp(lo, hi)
+        }).collect()
+}
+
 fn enforce_profit_floor(challenge: &Challenge, state: &State, mut action: Vec<f64>, shrink: f64) -> Vec<f64> {
     let mut profit = challenge.compute_profit(state, &action);
     if state.total_profit + profit >= 0.0 {
@@ -276,6 +310,7 @@ pub fn policy(challenge: &Challenge, state: &State, hp: &Hyperparameters) -> Res
     }
 
     let action = enforce_flow_feasibility(challenge, state, action)?;
+    let action = expand_to_feasibility_limit(challenge, state, &action);
     Ok(enforce_profit_floor(challenge, state, action, hp.profit_floor_shrink))
 }
 
