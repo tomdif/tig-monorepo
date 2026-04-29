@@ -1,6 +1,7 @@
 // c008_a001
 
-// c008_a002
+pub mod nodal_temporal_arb;
+pub use nodal_temporal_arb as c008_a002;
 
 // c008_a003
 
