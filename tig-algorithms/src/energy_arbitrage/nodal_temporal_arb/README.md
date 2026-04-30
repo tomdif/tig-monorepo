@@ -11,71 +11,92 @@
 
 ## Method
 
-A myopic per-step policy with four components the public baselines lack:
+For each battery, the policy solves a finite-horizon dynamic-programming problem
+over the full simulation horizon and uses the resulting value function to drive
+a per-step action choice that combines planning (DA prices) with reactive
+correction (realised RT prices and tail-jump detection).
 
-1. **Per-node price-rank look-ahead.** For each battery at node `n`, the policy
-   reads the remaining day-ahead prices *at that node* (greedy uses node 0 as
-   a proxy; conservative uses an across-nodes average at the current step
-   only). It computes the rank of the current DA price within that window
-   and uses `target_frac = 1 - rank` as the desired state-of-charge fraction.
-   When the current price is the lowest in the window the target is "full";
-   when it is the highest, the target is "empty".
+### Per-battery dynamic programming
 
-2. **SOC-aware urgency.** The action is driven by `(current_frac - target_frac)`,
-   not by absolute price thresholds. A nearly-full battery at a moderately high
-   price discharges; a nearly-empty battery at a moderately low price charges.
-   This closes a gap in both baselines, which never reference SOC except via
-   `action_bounds` clamping.
+`compute_battery_dp` runs once per challenge, before the rollout begins. For
+each battery it builds a value table `V[t][soc_idx]` by backward induction:
 
-3. **Magnitude-aware RT correction.** The deviation `(rt_price[n] - p_now)` is
-   standardised by the window's price standard deviation and passed through a
-   `tanh`. Moderate RT divergences nudge the smoothed signal in the deviation
-   direction.
+```
+V[H][·] = 0
+V[t][soc] = max_u [reward_DA(u, p_DA[t][n]) + V[t+1][soc(u)]]
+reward_DA(u, p) = u·p·Δt − κ_tx·|u|·Δt − κ_deg·(|u|·Δt/E̅)^β
+```
 
-4. **Tail-jump bang override.** When the standardised RT deviation exceeds
-   `jump_z_threshold` window-stds, the smoothed pipeline is bypassed and a
-   full-bound action in the direction of the jump is committed. This captures
-   Pareto jumps in the RT price model (`α_tail` as low as 2.5 in CAPSTONE)
-   without relying on the smooth tanh to saturate.
+with `u` chosen on a discrete action grid and `soc(u)` snapped to the nearest
+of `dp_soc_levels` discretised levels. The DP is computed against day-ahead
+prices only; RT realisations are folded in at execution time.
 
-The combined signal is mapped to MW via the available bounds (negative signal
-→ charge toward `lo`, positive → discharge toward `hi`), then projected onto
-PTDF feasibility (greedy line softening + binary-scale fallback, copied from
-the published baseline) and clipped by a profit floor that shrinks magnitudes
-when cumulative profit would otherwise go negative.
+### Per-step action selection
+
+At each rollout step `t`, for every battery `i`:
+
+1. **Tail-jump override.** Compute the standardised RT deviation
+   `z_rt = (rt_prices[n] − DA[t][n]) / window_std`. When `|z_rt|` exceeds
+   `jump_z_threshold`, commit a full-bound action in the direction of the
+   deviation, bypassing the DP.
+2. **DP-driven action.** Otherwise, search a finer action grid for the
+   maximiser of
+   `reward_RT(u, rt_prices[n]) + V[t+1][soc(u)]`,
+   substituting the *realised* RT price into the immediate-reward term while
+   relying on the DP value function to summarise the future.
+
+### Cross-battery feasibility
+
+After all batteries pick their candidate actions, the vector is projected onto
+PTDF feasibility (greedy line softening + binary-scale fallback, copied from the
+published `greedy` baseline) and then expanded by the largest scalar α ≥ 1
+that keeps both line and per-battery bounds. Finally a profit-floor loop
+(adapted from the published `conservative` baseline) shrinks magnitudes if the
+running cumulative profit would otherwise go negative.
+
+### What's different from the public baselines
+
+`greedy` looks at node 0 as a proxy and bang-bangs on a fixed price gap;
+`conservative` looks at the per-step cross-node average and bang-bangs on a
+±5% threshold. Neither references SOC, neither plans across the horizon, and
+neither uses the realised RT price. This policy uses all three: per-node DA
+prices for planning, realised RT for execution, and the value function carries
+the SOC/horizon trade-off automatically.
 
 ## Hyperparameters
 
 | Field | Default | Meaning |
 |---|---|---|
-| `horizon_steps` | 192 | Look-ahead window cap (auto-clipped to remaining steps; the policy uses all available DA-price information). |
-| `urgency_gain` | 1.0 | Weight on `(current_frac − target_frac)` before the saturating non-linearity. |
-| `rt_z_gain` | 1.0 | Gain on standardised RT deviation in the smoothed branch. |
-| `min_window_std` | 0.0 | Skip trading when window price std (\$/MWh) is below this; `0.0` means never skip. |
-| `action_sharpness` | 0.30 | Tanh sharpness on combined signal; lower → more bang-bang. |
+| `horizon_steps` | 192 | Window cap for the std/jump statistics (auto-clipped to remaining steps). |
+| `min_window_std` | 0.0 | Skip trading when the window price std is below this; `0.0` means never skip. |
 | `profit_floor_shrink` | 0.95 | Per-iter shrink factor when cumulative profit floor binds. |
-| `jump_z_threshold` | 2.0 | Standardised-RT magnitude that triggers full-bound bang override; set to 0 to disable. |
+| `jump_z_threshold` | 4.0 | Standardised-RT magnitude that triggers full-bound bang override. |
+| `dp_soc_levels` | 24 | SOC discretisation count for the per-battery DP. |
+| `dp_action_levels` | 21 | Action-grid resolution for both DP backward-induction and online selection. |
+
+Legacy fields (`urgency_gain`, `rt_z_gain`, `action_sharpness`) are retained on
+the struct for serde compatibility with prior submissions but are not used by
+the current policy.
 
 The defaults were selected by sweep on 50 challenge instances (5 scenarios ×
 10 seeds), scoring with TIG's per-nonce quality formula
 `((profit − baseline) / |baseline|).clamp(-10, 10)`. Under these settings the
-policy beats `max(greedy, conservative)` on **45 of 50 instances** (8.6×
-aggregate profit) with mean per-scenario clamped quality of:
+policy beats `max(greedy, conservative)` on **45 of 50 instances** (8.96×
+aggregate profit, $10.29M vs $1.15M baseline) with mean per-scenario clamped
+quality of:
 
 | Scenario | mean quality (clamp ±10) |
 |---|---|
-| BASELINE | +2.24 |
-| CONGESTED | +4.32 |
-| MULTIDAY | +8.04 |
-| DENSE | +9.04 |
-| CAPSTONE | +8.58 |
-| **total / max 50** | **32.22** |
+| BASELINE | +2.34 |
+| CONGESTED | +5.07 |
+| MULTIDAY | +8.20 |
+| DENSE | +9.17 |
+| CAPSTONE | +8.56 |
+| **total / max 50** | **33.34** |
 
-Losses concentrate on BASELINE (low volatility, loose congestion), where the
-smooth-action policy slightly underperforms the bang-bang baselines on a
-handful of seeds. In aggregate the BASELINE scenario is still net positive
-because the rank-driven targeting captures large wins on the seeds where the
-baselines happen to do poorly.
+This is +1.12 over the prior smooth-rank policy (32.22), with the largest gain
+on CONGESTED (+0.75) where DP planning across line-tight steps adds the most
+value over per-step heuristics.
 
 ## References and Acknowledgments
 

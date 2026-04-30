@@ -1,43 +1,49 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tig_challenges::energy_arbitrage::{constants, Challenge, State};
+use tig_challenges::energy_arbitrage::{constants, Battery, Challenge, State};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Hyperparameters {
     pub horizon_steps: usize,
-    pub urgency_gain: f64,
-    pub rt_z_gain: f64,
     pub min_window_std: f64,
-    pub action_sharpness: f64,
     pub profit_floor_shrink: f64,
     pub jump_z_threshold: f64,
+    pub dp_soc_levels: usize,
+    pub dp_action_levels: usize,
+    /// Legacy smooth-policy parameters retained for serde compat with prior submissions.
+    pub urgency_gain: f64,
+    pub rt_z_gain: f64,
+    pub action_sharpness: f64,
 }
 
 impl Default for Hyperparameters {
     fn default() -> Self {
         Self {
             horizon_steps: 192,
+            min_window_std: 0.0,
+            profit_floor_shrink: 0.95,
+            jump_z_threshold: 4.0,
+            dp_soc_levels: 24,
+            dp_action_levels: 21,
             urgency_gain: 1.0,
             rt_z_gain: 1.0,
-            min_window_std: 0.0,
             action_sharpness: 0.30,
-            profit_floor_shrink: 0.95,
-            jump_z_threshold: 2.0,
         }
     }
 }
 
 pub fn help() {
     println!(
-        "nodal_temporal_arb: per-node temporal arbitrage. Targets SOC by price-rank \
-in a per-node DA window, modulates with standardized RT deviation, projects to \
-PTDF feasibility, enforces non-negative cumulative profit, and falls through to a \
-full-bound bang when the realised RT price deviates from DA forecast by at least \
-`jump_z_threshold` window-stds (capturing tail-jump events). \
-Hyperparameters: horizon_steps, urgency_gain, rt_z_gain, min_window_std, \
-action_sharpness, profit_floor_shrink, jump_z_threshold."
+        "nodal_temporal_arb: per-battery dynamic-programming policy. \
+For each battery, computes a backward DP value table V[t][soc] using day-ahead \
+prices at the battery's node. At each step, picks the action that maximises \
+`reward(u, RT_now) + V[t+1][soc(u)]`. Tail RT jumps trigger a full-bound bang \
+override; PTDF feasibility is enforced via greedy line softening + symmetric \
+expansion; cumulative profit floor matches the published `conservative` baseline. \
+Hyperparameters: horizon_steps, min_window_std, profit_floor_shrink, \
+jump_z_threshold, dp_soc_levels, dp_action_levels."
     );
 }
 
@@ -47,7 +53,11 @@ pub fn solve_challenge(
     hyperparameters: &Option<Map<String, Value>>,
 ) -> Result<()> {
     let hp = parse_hyperparameters(hyperparameters);
-    let solution = challenge.grid_optimize(&|c, s| policy(c, s, &hp))?;
+    // Precompute per-battery DP value tables once for the whole rollout.
+    let dp_tables: Vec<(Vec<Vec<f64>>, f64)> = challenge.batteries.iter()
+        .map(|b| compute_battery_dp(challenge, b, hp.dp_soc_levels, hp.dp_action_levels))
+        .collect();
+    let solution = challenge.grid_optimize(&|c, s| policy(c, s, &hp, &dp_tables))?;
     save_solution(&solution)?;
     Ok(())
 }
@@ -229,27 +239,84 @@ fn window_stats(window: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
-fn price_rank(window: &[f64], p_now: f64) -> f64 {
-    if window.is_empty() {
-        return 0.5;
+/// Compute per-battery value function V[t][soc_idx] via backward DP using the full
+/// day-ahead price series at the battery's node. V[H] = 0; works back to t=0.
+/// Returns (V_table, soc_step). The DP plans against DA prices only — the per-step
+/// policy substitutes the realised RT price into the immediate-reward term.
+fn compute_battery_dp(
+    challenge: &Challenge,
+    battery: &Battery,
+    n_soc_levels: usize,
+    n_actions: usize,
+) -> (Vec<Vec<f64>>, f64) {
+    let h = challenge.num_steps;
+    let n = battery.node;
+    let soc_min = battery.soc_min_mwh;
+    let soc_max = battery.soc_max_mwh;
+    let soc_step = (soc_max - soc_min) / (n_soc_levels - 1).max(1) as f64;
+    let dt = constants::DELTA_T;
+    let kappa_tx = constants::KAPPA_TX;
+    let kappa_deg = constants::KAPPA_DEG;
+    let beta_deg = constants::BETA_DEG;
+
+    // Action grid spans [-power_charge, +power_discharge] linearly.
+    let action_grid: Vec<f64> = (0..n_actions).map(|i| {
+        let frac = (i as f64) / (n_actions - 1).max(1) as f64 * 2.0 - 1.0;
+        if frac < 0.0 { frac * battery.power_charge_mw } else { frac * battery.power_discharge_mw }
+    }).collect();
+
+    let mut v = vec![vec![0.0_f64; n_soc_levels]; h + 1];
+    for t in (0..h).rev() {
+        let p_da = challenge.market.day_ahead_prices[t][n];
+        for soc_idx in 0..n_soc_levels {
+            let soc = soc_min + soc_idx as f64 * soc_step;
+            let headroom = (soc_max - soc).max(0.0);
+            let available = (soc - soc_min).max(0.0);
+            let max_charge = (headroom / (battery.efficiency_charge.max(EPS) * dt))
+                .min(battery.power_charge_mw).max(0.0);
+            let max_discharge = (available * battery.efficiency_discharge / dt)
+                .min(battery.power_discharge_mw).max(0.0);
+            let lo = -max_charge;
+            let hi = max_discharge;
+            let mut best = f64::NEG_INFINITY;
+            for &u_raw in &action_grid {
+                let u = u_raw.clamp(lo, hi);
+                let revenue = u * p_da * dt;
+                let abs_u = u.abs();
+                let tx = kappa_tx * abs_u * dt;
+                let deg = kappa_deg * ((abs_u * dt) / battery.capacity_mwh).powf(beta_deg);
+                let reward = revenue - tx - deg;
+                let new_soc = battery.apply_action_to_soc(u, soc);
+                let new_soc_idx = (((new_soc - soc_min) / soc_step.max(EPS)).round() as i32)
+                    .max(0).min((n_soc_levels - 1) as i32) as usize;
+                let value = reward + v[t + 1][new_soc_idx];
+                if value > best { best = value; }
+            }
+            v[t][soc_idx] = if best.is_finite() { best } else { 0.0 };
+        }
     }
-    let strictly_below = window.iter().filter(|&&p| p < p_now).count() as f64;
-    let equal = window.iter().filter(|&&p| (p - p_now).abs() <= EPS).count() as f64;
-    // Midrank within ties; output in (0, 1).
-    (strictly_below + 0.5 * equal) / window.len() as f64
+    (v, soc_step)
 }
 
-pub fn policy(challenge: &Challenge, state: &State, hp: &Hyperparameters) -> Result<Vec<f64>> {
+pub fn policy(
+    challenge: &Challenge,
+    state: &State,
+    hp: &Hyperparameters,
+    dp_tables: &[(Vec<Vec<f64>>, f64)],
+) -> Result<Vec<f64>> {
     let t = state.time_step;
     let h = challenge.num_steps;
     let k = hp.horizon_steps.min(h.saturating_sub(t));
     let da = &challenge.market.day_ahead_prices;
-
     if t >= da.len() {
         return Err(anyhow!("DA prices missing for step {}", t));
     }
-
-    let mut action = vec![0.0; challenge.num_batteries];
+    let mut action = vec![0.0_f64; challenge.num_batteries];
+    let dt = constants::DELTA_T;
+    let kappa_tx = constants::KAPPA_TX;
+    let kappa_deg = constants::KAPPA_DEG;
+    let beta_deg = constants::BETA_DEG;
+    let n_actions = hp.dp_action_levels.max(3);
 
     for (i, battery) in challenge.batteries.iter().enumerate() {
         let n = battery.node;
@@ -257,56 +324,57 @@ pub fn policy(challenge: &Challenge, state: &State, hp: &Hyperparameters) -> Res
         if (hi - lo).abs() <= EPS {
             continue;
         }
-
         let end = (t + k).min(h);
         if end <= t {
             continue;
         }
         let window: Vec<f64> = (t..end).map(|s| da[s][n]).collect();
-        let (mean, std) = window_stats(&window);
+        let (_mean, std) = window_stats(&window);
         if !std.is_finite() || std < hp.min_window_std {
             continue;
         }
-
         let p_now = da[t][n];
         let z_rt = (state.rt_prices[n] - p_now) / std.max(EPS);
 
-        // Tail-jump override: when the realised RT price deviates by jump_z_threshold or
-        // more window-stds, force a full-bound action toward the deviation sign. This
-        // captures Pareto jumps that the smoothed signal would only respond to partially.
+        // Tail-jump override
         if hp.jump_z_threshold > 0.0 && z_rt.abs() >= hp.jump_z_threshold {
             action[i] = if z_rt > 0.0 { hi } else { lo };
             continue;
         }
 
-        let rank = price_rank(&window, p_now);
-
-        // Target SOC fraction: extreme prices → extreme target.
-        // p_now is the lowest in the window (rank≈0) → target_frac=1 (full).
-        // p_now is the highest in the window (rank≈1) → target_frac=0 (empty).
-        let target_frac = 1.0 - rank;
-        let denom = (battery.soc_max_mwh - battery.soc_min_mwh).max(EPS);
-        let cur_frac = ((state.socs[i] - battery.soc_min_mwh) / denom).clamp(0.0, 1.0);
-
-        // Urgency: positive → discharge (current SOC above target), negative → charge.
-        let urgency = (cur_frac - target_frac) * hp.urgency_gain;
-
-        // Standardized RT deviation. Bounded via tanh: large RT spikes saturate to ±1.
-        let _ = mean; // mean unused; rank captures position
-        let rt_signal = (z_rt * hp.rt_z_gain * 0.5).tanh();
-
-        // Combined signal in [-1, 1]; sharpness controls bang-bang vs continuous.
-        let signal = ((urgency + rt_signal) / hp.action_sharpness.max(0.1)).tanh();
-
-        // Map signed signal to MW within available bounds.
-        // signal > 0 → discharge into hi (≥0); signal < 0 → charge toward lo (≤0).
-        let raw = if signal >= 0.0 {
-            signal * hi
-        } else {
-            -signal * lo
-        };
-
-        action[i] = raw.clamp(lo, hi);
+        // DP value-driven action selection: maximise reward(u, RT_now) + V[t+1][soc(u)]
+        if i >= dp_tables.len() {
+            continue;
+        }
+        let (ref v_tab, soc_step) = dp_tables[i];
+        if t + 1 >= v_tab.len() {
+            continue;
+        }
+        let v_next = &v_tab[t + 1];
+        let n_soc_levels = v_next.len();
+        let soc_min_i = battery.soc_min_mwh;
+        let p_rt = state.rt_prices[n];
+        let mut best_value = f64::NEG_INFINITY;
+        let mut best_u = 0.0_f64;
+        for j in 0..n_actions {
+            let frac = (j as f64) / (n_actions - 1).max(1) as f64 * 2.0 - 1.0;
+            let u_raw = if frac < 0.0 { frac * battery.power_charge_mw } else { frac * battery.power_discharge_mw };
+            let u = u_raw.clamp(lo, hi);
+            let revenue = u * p_rt * dt;
+            let abs_u = u.abs();
+            let tx = kappa_tx * abs_u * dt;
+            let deg = kappa_deg * ((abs_u * dt) / battery.capacity_mwh).powf(beta_deg);
+            let reward = revenue - tx - deg;
+            let new_soc = battery.apply_action_to_soc(u, state.socs[i]);
+            let new_soc_idx = (((new_soc - soc_min_i) / soc_step.max(EPS)).round() as i32)
+                .max(0).min((n_soc_levels - 1) as i32) as usize;
+            let value = reward + v_next[new_soc_idx];
+            if value > best_value {
+                best_value = value;
+                best_u = u;
+            }
+        }
+        action[i] = best_u;
     }
 
     let action = enforce_flow_feasibility(challenge, state, action)?;
