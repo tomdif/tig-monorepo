@@ -4,9 +4,9 @@
 
 * **Challenge Name:** energy_arbitrage
 * **Algorithm Name:** nodal_temporal_arb
-* **Copyright:** 2026 [submitter to fill]
-* **Identity of Submitter:** [submitter to fill]
-* **Identity of Creator of Algorithmic Method:** [submitter to fill]
+* **Copyright:** 2026 tomdif
+* **Identity of Submitter:** tomdif
+* **Identity of Creator of Algorithmic Method:** tomdif
 * **Unique Algorithm Identifier (UAI):** null
 
 ## Method
