@@ -23,13 +23,33 @@ each battery it builds a value table `V[t][soc_idx]` by backward induction:
 
 ```
 V[H][·] = 0
-V[t][soc] = max_u [reward_DA(u, p_DA[t][n]) + V[t+1][soc(u)]]
-reward_DA(u, p) = u·p·Δt − κ_tx·|u|·Δt − κ_deg·(|u|·Δt/E̅)^β
+V[t][soc] = max_u [reward(u, p_eff[t]) + V[t+1][soc(u)]]
+reward(u, p) = u·p·Δt − κ_tx·|u|·Δt − κ_deg·(|u|·Δt/E̅)^β
+p_eff[t] = p_DA[t][n] + scale · E[RT congestion premium at node n, step t]
 ```
 
 with `u` chosen on a discrete action grid and `soc(u)` snapped to the nearest
-of `dp_soc_levels` discretised levels. The DP is computed against day-ahead
-prices only; RT realisations are folded in at execution time.
+of `dp_soc_levels` discretised levels.
+
+### Expected RT premium adjustment
+
+The DP plans against `p_DA[t][n]`, but the actual reward at execution uses the
+realised `RT[t][n]`, which adds a congestion premium when the line at node `n`
+is under stress. To reduce the DP's pessimism on congested nodes, we precompute
+the expected RT premium at each future step using the *known* exogenous-injection
+schedule:
+
+```
+p_l(t) = (|flow_l(exog[t-1])| / (τ_cong · flow_limit_l))^10        per line
+p_congest(t, n) = min(1, Σ over lines incident to n of p_l(t))
+expected_premium(t, n) = p_congest(t, n) · GAMMA_PRICE · E[max(0, N(0,1))]
+```
+
+with `E[max(0, N(0,1))] = 1/√(2π) ≈ 0.399`. The `congestion_premium_scale`
+hyperparameter (default 2.0) corrects for systematic underestimation in the
+analytical formula — a sweep showed scale 2.0 gives the best aggregate clamped
+quality, suggesting the steep `(·)^10` probability curve and the multi-line
+incidence both bias the prediction downward.
 
 ### Per-step action selection
 
@@ -73,6 +93,7 @@ the SOC/horizon trade-off automatically.
 | `jump_z_threshold` | 4.0 | Standardised-RT magnitude that triggers full-bound bang override. |
 | `dp_soc_levels` | 24 | SOC discretisation count for the per-battery DP. |
 | `dp_action_levels` | 21 | Action-grid resolution for both DP backward-induction and online selection. |
+| `congestion_premium_scale` | 2.0 | Multiplier on the predicted RT congestion premium added to DA prices in the DP. |
 
 Legacy fields (`urgency_gain`, `rt_z_gain`, `action_sharpness`) are retained on
 the struct for serde compatibility with prior submissions but are not used by
@@ -81,22 +102,23 @@ the current policy.
 The defaults were selected by sweep on 50 challenge instances (5 scenarios ×
 10 seeds), scoring with TIG's per-nonce quality formula
 `((profit − baseline) / |baseline|).clamp(-10, 10)`. Under these settings the
-policy beats `max(greedy, conservative)` on **45 of 50 instances** (8.96×
-aggregate profit, $10.29M vs $1.15M baseline) with mean per-scenario clamped
-quality of:
+policy beats `max(greedy, conservative)` on **45 of 50 instances** with mean
+per-scenario clamped quality of:
 
 | Scenario | mean quality (clamp ±10) |
 |---|---|
-| BASELINE | +2.34 |
-| CONGESTED | +5.07 |
-| MULTIDAY | +8.20 |
-| DENSE | +9.17 |
-| CAPSTONE | +8.56 |
-| **total / max 50** | **33.34** |
+| BASELINE | +2.32 |
+| CONGESTED | +5.21 |
+| MULTIDAY | +8.19 |
+| DENSE | +9.16 |
+| CAPSTONE | +8.55 |
+| **total / max 50** | **33.44** |
 
-This is +1.12 over the prior smooth-rank policy (32.22), with the largest gain
-on CONGESTED (+0.75) where DP planning across line-tight steps adds the most
-value over per-step heuristics.
+This is +1.22 over the prior smooth-rank policy (32.22), driven primarily by
+the DP itself (+1.12) plus the congestion-premium adjustment (+0.10). The
+largest gains are on CONGESTED (+0.89 vs smooth-rank baseline), where DP
+planning across line-tight steps and price-pre-positioning at predicted-congested
+nodes both contribute.
 
 ## References and Acknowledgments
 

@@ -12,6 +12,7 @@ pub struct Hyperparameters {
     pub jump_z_threshold: f64,
     pub dp_soc_levels: usize,
     pub dp_action_levels: usize,
+    pub congestion_premium_scale: f64,
     /// Legacy smooth-policy parameters retained for serde compat with prior submissions.
     pub urgency_gain: f64,
     pub rt_z_gain: f64,
@@ -27,6 +28,7 @@ impl Default for Hyperparameters {
             jump_z_threshold: 4.0,
             dp_soc_levels: 24,
             dp_action_levels: 21,
+            congestion_premium_scale: 2.0,
             urgency_gain: 1.0,
             rt_z_gain: 1.0,
             action_sharpness: 0.30,
@@ -55,7 +57,7 @@ pub fn solve_challenge(
     let hp = parse_hyperparameters(hyperparameters);
     // Precompute per-battery DP value tables once for the whole rollout.
     let dp_tables: Vec<(Vec<Vec<f64>>, f64)> = challenge.batteries.iter()
-        .map(|b| compute_battery_dp(challenge, b, hp.dp_soc_levels, hp.dp_action_levels))
+        .map(|b| compute_battery_dp(challenge, b, hp.dp_soc_levels, hp.dp_action_levels, hp.congestion_premium_scale))
         .collect();
     let solution = challenge.grid_optimize(&|c, s| policy(c, s, &hp, &dp_tables))?;
     save_solution(&solution)?;
@@ -239,15 +241,51 @@ fn window_stats(window: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
+/// Predict the expected RT congestion premium at node `n` for time step `t`.
+/// Uses the lagged exogenous-injection schedule (RT at step t uses congestion
+/// indicators based on exogenous_injections at step t-1) to compute per-line
+/// congestion probability `(|flow|/(τ·limit))^10`, sums over lines incident to
+/// `n`, and multiplies by `GAMMA_PRICE * E[max(0,N(0,1))]` to give the expected
+/// $/MWh premium added to DA at that node.
+fn predicted_rt_premium(challenge: &Challenge, t: usize, n: usize) -> f64 {
+    if t == 0 { return 0.0; }
+    let exog = &challenge.exogenous_injections[t - 1];
+    let mut inj = vec![0.0_f64; challenge.network.num_nodes];
+    let slack = challenge.network.slack_bus;
+    let mut sum = 0.0_f64;
+    for i in 0..challenge.network.num_nodes {
+        if i != slack {
+            inj[i] = exog[i];
+            sum += exog[i];
+        }
+    }
+    inj[slack] = -sum;
+    let mut total_p = 0.0_f64;
+    for &l in &challenge.network.node_incident_lines[n] {
+        let flow: f64 = (0..challenge.network.num_nodes)
+            .map(|k| challenge.network.ptdf[l][k] * inj[k])
+            .sum();
+        let limit = challenge.network.flow_limits[l];
+        if limit <= EPS { continue; }
+        let p = (flow.abs() / (challenge.network.congestion_threshold * limit)).powi(10);
+        total_p += p.min(1.0);
+    }
+    let p_congest = total_p.min(1.0);
+    let e_zeta = (2.0_f64 / std::f64::consts::PI).sqrt() / 2.0;
+    p_congest * constants::GAMMA_PRICE * e_zeta
+}
+
 /// Compute per-battery value function V[t][soc_idx] via backward DP using the full
-/// day-ahead price series at the battery's node. V[H] = 0; works back to t=0.
-/// Returns (V_table, soc_step). The DP plans against DA prices only — the per-step
-/// policy substitutes the realised RT price into the immediate-reward term.
+/// day-ahead price series at the battery's node, plus an expected-RT-premium
+/// adjustment derived from the known exogenous-injection schedule.
+/// V[H] = 0; works back to t=0. Returns (V_table, soc_step). The per-step policy
+/// substitutes the realised RT price into the immediate-reward term.
 fn compute_battery_dp(
     challenge: &Challenge,
     battery: &Battery,
     n_soc_levels: usize,
     n_actions: usize,
+    premium_scale: f64,
 ) -> (Vec<Vec<f64>>, f64) {
     let h = challenge.num_steps;
     let n = battery.node;
@@ -265,9 +303,15 @@ fn compute_battery_dp(
         if frac < 0.0 { frac * battery.power_charge_mw } else { frac * battery.power_discharge_mw }
     }).collect();
 
+    // Precompute predicted prices: DA + scaled expected RT congestion premium.
+    let predicted_price: Vec<f64> = (0..h).map(|t| {
+        challenge.market.day_ahead_prices[t][n]
+            + premium_scale * predicted_rt_premium(challenge, t, n)
+    }).collect();
+
     let mut v = vec![vec![0.0_f64; n_soc_levels]; h + 1];
     for t in (0..h).rev() {
-        let p_da = challenge.market.day_ahead_prices[t][n];
+        let p_eff = predicted_price[t];
         for soc_idx in 0..n_soc_levels {
             let soc = soc_min + soc_idx as f64 * soc_step;
             let headroom = (soc_max - soc).max(0.0);
@@ -281,7 +325,7 @@ fn compute_battery_dp(
             let mut best = f64::NEG_INFINITY;
             for &u_raw in &action_grid {
                 let u = u_raw.clamp(lo, hi);
-                let revenue = u * p_da * dt;
+                let revenue = u * p_eff * dt;
                 let abs_u = u.abs();
                 let tx = kappa_tx * abs_u * dt;
                 let deg = kappa_deg * ((abs_u * dt) / battery.capacity_mwh).powf(beta_deg);
